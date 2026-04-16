@@ -8,15 +8,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
 	pb "jumjump/server/internal/pb"
+
+	"google.golang.org/protobuf/proto"
 )
 
 const (
 	centerRadius    = int32(4)
 	campDepth       = int32(4)
-	turnDuration    = 30 * time.Second
-	disconnectGrace = 20 * time.Second
+	turnDuration    = 300 * time.Second
+	disconnectGrace = 200 * time.Second
 )
 
 var (
@@ -700,7 +701,7 @@ func buildStarBoard() (map[string]struct{}, [6][]boardPos) {
 	for a := int32(0); a < campDepth; a++ {
 		for b := int32(0); b < campDepth-a; b++ {
 			q := centerRadius + 1 + b
-			r := -centerRadius + a + b
+			r := -centerRadius + a
 			base = append(base, boardPos{X: q, Y: r})
 		}
 	}
