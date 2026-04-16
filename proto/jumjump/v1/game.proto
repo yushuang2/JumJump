@@ -1,0 +1,144 @@
+﻿syntax = "proto3";
+
+package jumjump.v1;
+
+option go_package = "jumjump/server/internal/pb;pb";
+option csharp_namespace = "JumJump.Proto";
+
+message Envelope {
+  uint32 cmd = 1;
+  uint64 seq = 2;
+  uint64 ack = 3;
+  int64 ts = 4;
+  bytes payload = 5;
+  string room_id = 6;
+  uint32 room_version = 7;
+}
+
+enum Cmd {
+  CMD_UNSPECIFIED = 0;
+
+  C2S_LOGIN = 1001;
+  S2C_LOGIN_ACK = 1002;
+
+  C2S_MATCH_START = 1101;
+  C2S_MATCH_CANCEL = 1102;
+  S2C_MATCH_FOUND = 1103;
+
+  S2C_GAME_START = 1201;
+  C2S_MOVE = 1202;
+  S2C_MOVE_RESULT = 1203;
+  S2C_TURN_CHANGE = 1204;
+  S2C_SNAPSHOT = 1205;
+  S2C_GAME_OVER = 1206;
+
+  C2S_PING = 1301;
+  S2C_PONG = 1302;
+  C2S_RECONNECT = 1303;
+  S2C_RECONNECT_ACK = 1304;
+
+  S2C_ERROR = 9001;
+}
+
+message LoginReq {
+  string wx_code = 1;
+  string client_version = 2;
+}
+
+message LoginAck {
+  uint64 user_id = 1;
+  string token = 2;
+  int64 token_expire_at = 3;
+}
+
+message MatchStartReq {
+  uint32 mode = 1;
+}
+
+message MatchCancelReq {}
+
+message MatchFound {
+  string room_id = 1;
+  uint64 self_user_id = 2;
+  uint64 opponent_user_id = 3;
+  int32 self_side = 4;
+}
+
+message Pos {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message Piece {
+  uint64 owner_id = 1;
+  Pos pos = 2;
+}
+
+message GameStart {
+  string room_id = 1;
+  repeated Piece pieces = 2;
+  uint64 current_turn_user_id = 3;
+  int64 turn_deadline_ms = 4;
+  uint32 room_version = 5;
+}
+
+message MoveReq {
+  Pos from = 1;
+  Pos to = 2;
+  repeated Pos path = 3;
+}
+
+message MoveResult {
+  uint64 actor_user_id = 1;
+  Pos from = 2;
+  Pos to = 3;
+  bool accepted = 4;
+  string reject_reason = 5;
+  uint32 room_version = 6;
+  repeated Pos path = 7;
+}
+
+message TurnChange {
+  uint64 current_turn_user_id = 1;
+  int64 turn_deadline_ms = 2;
+  uint32 room_version = 3;
+}
+
+message Snapshot {
+  string room_id = 1;
+  repeated Piece pieces = 2;
+  uint64 current_turn_user_id = 3;
+  int64 turn_deadline_ms = 4;
+  uint32 room_version = 5;
+}
+
+message GameOver {
+  string room_id = 1;
+  uint64 winner_user_id = 2;
+  uint32 reason = 3;
+}
+
+message Ping {
+  int64 client_ts = 1;
+}
+
+message Pong {
+  int64 client_ts = 1;
+  int64 server_ts = 2;
+}
+
+message ReconnectReq {
+  string token = 1;
+  string room_id = 2;
+  uint32 last_room_version = 3;
+}
+
+message ReconnectAck {
+  bool ok = 1;
+  string reason = 2;
+}
+
+message ErrorMsg {
+  uint32 code = 1;
+  string message = 2;
+}
