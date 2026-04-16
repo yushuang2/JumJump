@@ -1,0 +1,676 @@
+﻿using System;
+using System.Collections.Generic;
+using JumJump.Network;
+using JumJump.Proto;
+using UnityEngine;
+
+namespace JumJump.Game
+{
+    public class GameBootstrap : MonoBehaviour
+    {
+        [SerializeField] private string serverUrl = "ws://127.0.0.1:8080/ws";
+        [SerializeField] private bool showCoordinates;
+
+        private const int CenterRadius = 4;
+        private const int CampDepth = 4;
+        private const int BoardExtent = 8;
+        private const float HexSize = 36f;
+        private const float CellSize = 28f;
+        private static readonly Vector2Int[] GridLineDirs =
+        {
+            new Vector2Int(1, 0),
+            new Vector2Int(0, 1),
+            new Vector2Int(1, -1),
+        };
+        private static readonly Color[] CampColors =
+        {
+            new Color(0.95f, 0.60f, 0.60f, 0.35f),
+            new Color(0.95f, 0.80f, 0.55f, 0.35f),
+            new Color(0.88f, 0.92f, 0.56f, 0.35f),
+            new Color(0.60f, 0.88f, 0.63f, 0.35f),
+            new Color(0.62f, 0.78f, 0.95f, 0.35f),
+            new Color(0.82f, 0.68f, 0.95f, 0.35f),
+        };
+
+        private readonly LocalBoardState _board = new LocalBoardState();
+        private readonly List<Vector2Int> _plannedPath = new List<Vector2Int>();
+        private readonly HashSet<Vector2Int> _starCells = BuildStarCells();
+        private readonly Dictionary<Vector2Int, int> _campByCell = BuildCampByCell();
+
+        private GameClient _client;
+        private string _status = "init";
+        private ulong _selfUserId;
+        private string _token = string.Empty;
+        private string _roomId = string.Empty;
+        private Vector2Int? _selectedFrom;
+        private float _nextPingAt;
+
+        private bool _reconnectPending;
+        private bool _reconnectInFlight;
+        private float _nextReconnectAt;
+        private GUIStyle _coordStyle;
+        private GUIStyle _coordBgStyle;
+
+        private async void Start()
+        {
+            _client = new GameClient();
+            _client.OnEnvelope += HandleEnvelope;
+            _client.OnDisconnected += HandleDisconnected;
+
+            await InitialConnectAsync();
+        }
+
+        private void Update()
+        {
+            _client?.PumpIncoming();
+
+            if (_client != null && _selfUserId != 0 && _client.IsConnected && Time.realtimeSinceStartup >= _nextPingAt)
+            {
+                _nextPingAt = Time.realtimeSinceStartup + 5f;
+                _ = _client.PingAsync();
+            }
+
+            if (_reconnectPending && !_reconnectInFlight && Time.realtimeSinceStartup >= _nextReconnectAt)
+            {
+                _ = TryReconnectAsync();
+            }
+        }
+
+        private async System.Threading.Tasks.Task InitialConnectAsync()
+        {
+            _status = "connecting";
+            try
+            {
+                await _client.ConnectAsync(serverUrl);
+                _status = "connected, login";
+                await _client.LoginAsync("dev_wx_code", Application.version);
+            }
+            catch (Exception ex)
+            {
+                _status = $"connect failed: {ex.Message}";
+                ScheduleReconnect();
+            }
+        }
+
+        private async System.Threading.Tasks.Task TryReconnectAsync()
+        {
+            _reconnectInFlight = true;
+            try
+            {
+                _status = "reconnecting...";
+                await _client.ConnectAsync(serverUrl);
+
+                if (!string.IsNullOrEmpty(_token))
+                {
+                    await _client.ReconnectAsync(_token, _roomId, _client.LastRoomVersion);
+                    _status = "reconnect request sent";
+                }
+                else
+                {
+                    await _client.LoginAsync("dev_wx_code", Application.version);
+                    _status = "reconnect login sent";
+                }
+
+                _reconnectPending = false;
+            }
+            catch (Exception ex)
+            {
+                _status = $"reconnect failed: {ex.Message}";
+                ScheduleReconnect();
+            }
+            finally
+            {
+                _reconnectInFlight = false;
+            }
+        }
+
+        private void HandleDisconnected()
+        {
+            _status = "connection lost";
+            ScheduleReconnect();
+        }
+
+        private void ScheduleReconnect()
+        {
+            _reconnectPending = true;
+            _nextReconnectAt = Time.realtimeSinceStartup + 2f;
+        }
+
+        private void HandleEnvelope(Envelope env)
+        {
+            _roomId = env.RoomId;
+            var cmd = (Cmd)env.Cmd;
+
+            switch (cmd)
+            {
+                case Cmd.S2CLoginAck:
+                {
+                    var ack = ProtocolCodec.ParsePayload(env, LoginAck.Parser);
+                    _selfUserId = ack.UserId;
+                    _token = ack.Token;
+                    _status = $"login ok uid={_selfUserId}, matching";
+                    _ = _client.StartMatchAsync();
+                    break;
+                }
+                case Cmd.S2CMatchFound:
+                {
+                    var found = ProtocolCodec.ParsePayload(env, MatchFound.Parser);
+                    _status = $"matched room={found.RoomId} vs={found.OpponentUserId}";
+                    break;
+                }
+                case Cmd.S2CGameStart:
+                {
+                    var start = ProtocolCodec.ParsePayload(env, GameStart.Parser);
+                    _board.ApplyGameStart(start);
+                    ClearMoveSelection();
+                    _status = "game start";
+                    break;
+                }
+                case Cmd.S2CMoveResult:
+                {
+                    var move = ProtocolCodec.ParsePayload(env, MoveResult.Parser);
+                    _board.ApplyMoveResult(move);
+                    ClearMoveSelection();
+                    _status = move.Accepted ? "move accepted" : $"move rejected: {move.RejectReason}";
+                    break;
+                }
+                case Cmd.S2CTurnChange:
+                {
+                    var turn = ProtocolCodec.ParsePayload(env, TurnChange.Parser);
+                    _board.ApplyTurnChange(turn);
+                    break;
+                }
+                case Cmd.S2CSnapshot:
+                {
+                    var snap = ProtocolCodec.ParsePayload(env, Snapshot.Parser);
+                    _board.ApplySnapshot(snap);
+                    ClearMoveSelection();
+                    _status = "snapshot synced";
+                    break;
+                }
+                case Cmd.S2CReconnectAck:
+                {
+                    var ack = ProtocolCodec.ParsePayload(env, ReconnectAck.Parser);
+                    if (ack.Ok)
+                    {
+                        _status = "reconnect ok";
+                        _reconnectPending = false;
+                    }
+                    else
+                    {
+                        _status = $"reconnect rejected: {ack.Reason}, relogin";
+                        _ = _client.LoginAsync("dev_wx_code", Application.version);
+                    }
+                    break;
+                }
+                case Cmd.S2CPong:
+                {
+                    break;
+                }
+                case Cmd.S2CGameOver:
+                {
+                    var over = ProtocolCodec.ParsePayload(env, GameOver.Parser);
+                    _status = $"game over winner={over.WinnerUserId}";
+                    break;
+                }
+                case Cmd.S2CError:
+                {
+                    var err = ProtocolCodec.ParsePayload(env, ErrorMsg.Parser);
+                    _status = $"error {err.Code}: {err.Message}";
+                    break;
+                }
+            }
+
+            Debug.Log($"recv cmd={cmd} room={env.RoomId} v={env.RoomVersion} status={_status}");
+        }
+
+        private void OnGUI()
+        {
+            GUILayout.BeginArea(new Rect(10, 10, 1080, 760));
+            GUILayout.Label($"Status: {_status}");
+            GUILayout.Label($"Room: {_roomId}");
+            GUILayout.Label($"Self: {_selfUserId}");
+            GUILayout.Label($"Turn: {_board.CurrentTurnUserId}");
+            GUILayout.Label(_selectedFrom.HasValue
+                ? $"Selected: {_selectedFrom.Value.x},{_selectedFrom.Value.y}"
+                : "Selected: none");
+            GUILayout.Label($"Planned jumps: {FormatPath(_plannedPath)}");
+
+            GUILayout.Space(8);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Submit Jump Path", GUILayout.Width(150)))
+            {
+                SubmitPlannedPath();
+            }
+            if (GUILayout.Button("Undo Last Jump", GUILayout.Width(150)))
+            {
+                UndoLastJump();
+            }
+            if (GUILayout.Button("Clear Selection", GUILayout.Width(150)))
+            {
+                ClearMoveSelection();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(8);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Start Match", GUILayout.Width(120)))
+            {
+                _ = _client.StartMatchAsync();
+            }
+            if (GUILayout.Button("Cancel Match", GUILayout.Width(120)))
+            {
+                _ = _client.CancelMatchAsync();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(8);
+            if (GUILayout.Button(showCoordinates ? "Coords: ON" : "Coords: OFF", GUILayout.Width(150)))
+            {
+                showCoordinates = !showCoordinates;
+            }
+
+            GUILayout.EndArea();
+
+            DrawStarBoard(new Rect(340, 40, 760, 700));
+        }
+
+        private void DrawStarBoard(Rect area)
+        {
+            EnsureStyles();
+
+            var center = new Vector2(area.x + area.width * 0.5f, area.y + area.height * 0.5f);
+
+            DrawGridLines(center);
+
+            for (var r = -BoardExtent; r <= BoardExtent; r++)
+            {
+                for (var q = -BoardExtent; q <= BoardExtent; q++)
+                {
+                    var pos = new Vector2Int(q, r);
+                    if (!_starCells.Contains(pos))
+                    {
+                        continue;
+                    }
+
+                    var p = AxialToScreen(pos, center);
+                    var rect = new Rect(p.x - CellSize * 0.5f, p.y - CellSize * 0.5f, CellSize, CellSize);
+
+                    if (_campByCell.TryGetValue(pos, out var campId))
+                    {
+                        var prev = GUI.color;
+                        GUI.color = CampColors[campId % CampColors.Length];
+                        GUI.DrawTexture(rect, Texture2D.whiteTexture);
+                        GUI.color = prev;
+                    }
+
+                    var label = ".";
+                    var isHint = false;
+                    if (_board.Pieces.TryGetValue(pos, out var owner))
+                    {
+                        label = owner == _selfUserId ? "S" : "O";
+                    }
+                    else if (_selectedFrom.HasValue)
+                    {
+                        var current = _plannedPath.Count == 0 ? _selectedFrom.Value : _plannedPath[_plannedPath.Count - 1];
+                        if (_plannedPath.Count == 0 && IsAdjacentStep(current, pos))
+                        {
+                            label = "+";
+                            isHint = true;
+                        }
+                        else if (CanJumpTo(current, pos))
+                        {
+                            label = "J";
+                            isHint = true;
+                        }
+                    }
+
+                    var prevColor = GUI.color;
+                    if (isHint)
+                    {
+                        GUI.color = new Color(0.7f, 1f, 0.7f);
+                    }
+                    if (GUI.Button(rect, label))
+                    {
+                        OnCellClicked(pos);
+                    }
+                    GUI.color = prevColor;
+
+                    if (showCoordinates)
+                    {
+                        var coordRect = new Rect(rect.x - 8f, rect.y - 12f, rect.width + 16f, 12f);
+                        GUI.Box(coordRect, GUIContent.none, _coordBgStyle);
+                        GUI.Label(coordRect, $"{pos.x},{pos.y}", _coordStyle);
+                    }
+                }
+            }
+        }
+
+        private void EnsureStyles()
+        {
+            if (_coordStyle != null)
+            {
+                return;
+            }
+
+            _coordStyle = new GUIStyle(GUI.skin.label)
+            {
+                fontSize = 9,
+                alignment = TextAnchor.MiddleCenter,
+            };
+            _coordStyle.normal.textColor = new Color(0f, 0f, 0f, 1f);
+
+            _coordBgStyle = new GUIStyle(GUI.skin.box);
+            _coordBgStyle.normal.background = Texture2D.whiteTexture;
+            _coordBgStyle.border = new RectOffset(0, 0, 0, 0);
+        }
+
+        private void DrawGridLines(Vector2 center)
+        {
+            for (var r = -BoardExtent; r <= BoardExtent; r++)
+            {
+                for (var q = -BoardExtent; q <= BoardExtent; q++)
+                {
+                    var from = new Vector2Int(q, r);
+                    if (!_starCells.Contains(from))
+                    {
+                        continue;
+                    }
+
+                    var fromP = AxialToScreen(from, center);
+                    for (var i = 0; i < GridLineDirs.Length; i++)
+                    {
+                        var to = from + GridLineDirs[i];
+                        if (!_starCells.Contains(to))
+                        {
+                            continue;
+                        }
+                        var toP = AxialToScreen(to, center);
+                        DrawLine(fromP, toP, new Color(0f, 0f, 0f, 0.22f), 1f);
+                    }
+                }
+            }
+        }
+
+        private static void DrawLine(Vector2 a, Vector2 b, Color color, float width)
+        {
+            var prevColor = GUI.color;
+            var prevMatrix = GUI.matrix;
+
+            var delta = b - a;
+            var angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
+            var length = delta.magnitude;
+
+            GUI.color = color;
+            GUIUtility.RotateAroundPivot(angle, a);
+            GUI.DrawTexture(new Rect(a.x, a.y - width * 0.5f, length, width), Texture2D.whiteTexture);
+
+            GUI.matrix = prevMatrix;
+            GUI.color = prevColor;
+        }
+
+        private static Vector2 AxialToScreen(Vector2Int pos, Vector2 center)
+        {
+            // Standard pointy-top axial projection:
+            // x = sqrt(3) * size * (q + r/2), y = 3/2 * size * r
+            var x = center.x + HexSize * (pos.x + pos.y * 0.5f);
+            var y = center.y - HexSize * Mathf.Sqrt(3f) * 0.5f * pos.y;
+            return new Vector2(x, y);
+        }
+
+        private void OnCellClicked(Vector2Int pos)
+        {
+            if (!_starCells.Contains(pos))
+            {
+                return;
+            }
+            if (_selfUserId == 0)
+            {
+                return;
+            }
+            if (_board.CurrentTurnUserId != _selfUserId)
+            {
+                _status = "not your turn";
+                return;
+            }
+
+            if (!_selectedFrom.HasValue)
+            {
+                if (_board.Pieces.TryGetValue(pos, out var owner) && owner == _selfUserId)
+                {
+                    _selectedFrom = pos;
+                    _status = "source selected";
+                }
+                return;
+            }
+
+            if (_board.Pieces.ContainsKey(pos))
+            {
+                _status = "target occupied";
+                return;
+            }
+
+            var current = _plannedPath.Count == 0 ? _selectedFrom.Value : _plannedPath[_plannedPath.Count - 1];
+            if (IsAdjacentStep(current, pos) && _plannedPath.Count == 0)
+            {
+                _ = _client.MoveAsync(current.x, current.y, pos.x, pos.y);
+                _status = "submitted adjacent move";
+                return;
+            }
+
+            if (IsJumpStep(current, pos))
+            {
+                if (CanJumpTo(current, pos))
+                {
+                    _plannedPath.Add(pos);
+                    _status = "jump step added";
+                }
+                else
+                {
+                    _status = "jump needs middle piece";
+                }
+                return;
+            }
+
+            _status = "invalid click for move";
+        }
+
+        private void SubmitPlannedPath()
+        {
+            if (!_selectedFrom.HasValue || _plannedPath.Count == 0)
+            {
+                _status = "no planned jump path";
+                return;
+            }
+
+            var from = _selectedFrom.Value;
+            var to = _plannedPath[_plannedPath.Count - 1];
+            var protoPath = new List<Pos>(_plannedPath.Count);
+            for (var i = 0; i < _plannedPath.Count; i++)
+            {
+                var p = _plannedPath[i];
+                protoPath.Add(new Pos { X = p.x, Y = p.y });
+            }
+
+            _ = _client.MoveAsync(from.x, from.y, to.x, to.y, protoPath);
+            _status = "submitted jump path";
+        }
+
+        private void UndoLastJump()
+        {
+            if (_plannedPath.Count == 0)
+            {
+                return;
+            }
+            _plannedPath.RemoveAt(_plannedPath.Count - 1);
+            _status = "last jump removed";
+        }
+
+        private void ClearMoveSelection()
+        {
+            _selectedFrom = null;
+            _plannedPath.Clear();
+        }
+
+        private bool CanJumpTo(Vector2Int from, Vector2Int to)
+        {
+            if (!_starCells.Contains(to) || !IsJumpStep(from, to))
+            {
+                return false;
+            }
+            var occupied = BuildVirtualOccupied();
+            if (occupied.Contains(to))
+            {
+                return false;
+            }
+
+            var mid = new Vector2Int((from.x + to.x) / 2, (from.y + to.y) / 2);
+            return occupied.Contains(mid);
+        }
+
+        private HashSet<Vector2Int> BuildVirtualOccupied()
+        {
+            var occupied = new HashSet<Vector2Int>(_board.Pieces.Keys);
+            if (!_selectedFrom.HasValue)
+            {
+                return occupied;
+            }
+
+            var current = _selectedFrom.Value;
+            for (var i = 0; i < _plannedPath.Count; i++)
+            {
+                occupied.Remove(current);
+                current = _plannedPath[i];
+                occupied.Add(current);
+            }
+            return occupied;
+        }
+
+        private static bool IsAdjacentStep(Vector2Int from, Vector2Int to)
+        {
+            var dx = to.x - from.x;
+            var dy = to.y - from.y;
+            return (dx == 1 && dy == 0) ||
+                   (dx == 1 && dy == -1) ||
+                   (dx == 0 && dy == -1) ||
+                   (dx == -1 && dy == 0) ||
+                   (dx == -1 && dy == 1) ||
+                   (dx == 0 && dy == 1);
+        }
+
+        private static bool IsJumpStep(Vector2Int from, Vector2Int to)
+        {
+            var dx = to.x - from.x;
+            var dy = to.y - from.y;
+            return (dx == 2 && dy == 0) ||
+                   (dx == 2 && dy == -2) ||
+                   (dx == 0 && dy == -2) ||
+                   (dx == -2 && dy == 0) ||
+                   (dx == -2 && dy == 2) ||
+                   (dx == 0 && dy == 2);
+        }
+
+        private static HashSet<Vector2Int> BuildStarCells()
+        {
+            var outSet = new HashSet<Vector2Int>();
+
+            for (var q = -CenterRadius; q <= CenterRadius; q++)
+            {
+                for (var r = -CenterRadius; r <= CenterRadius; r++)
+                {
+                    if (IsCenterHexCell(q, r))
+                    {
+                        outSet.Add(new Vector2Int(q, r));
+                    }
+                }
+            }
+
+            var baseCamp = new List<Vector2Int>(10);
+            for (var a = 0; a < CampDepth; a++)
+            {
+                for (var b = 0; b < CampDepth - a; b++)
+                {
+                    var q = CenterRadius + 1 + b;
+                    var r = -CenterRadius + a;
+                    baseCamp.Add(new Vector2Int(q, r));
+                }
+            }
+
+            for (var i = 0; i < 6; i++)
+            {
+                for (var idx = 0; idx < baseCamp.Count; idx++)
+                {
+                    var p = baseCamp[idx];
+                    for (var k = 0; k < i; k++)
+                    {
+                        p = Rotate60CW(p);
+                    }
+                    outSet.Add(p);
+                }
+            }
+
+            return outSet;
+        }
+
+        private static Dictionary<Vector2Int, int> BuildCampByCell()
+        {
+            var map = new Dictionary<Vector2Int, int>(64);
+
+            var baseCamp = new List<Vector2Int>(10);
+            for (var a = 0; a < CampDepth; a++)
+            {
+                for (var b = 0; b < CampDepth - a; b++)
+                {
+                    var q = CenterRadius + 1 + b;
+                    var r = -CenterRadius + a;
+                    baseCamp.Add(new Vector2Int(q, r));
+                }
+            }
+
+            for (var camp = 0; camp < 6; camp++)
+            {
+                for (var i = 0; i < baseCamp.Count; i++)
+                {
+                    var p = baseCamp[i];
+                    for (var k = 0; k < camp; k++)
+                    {
+                        p = Rotate60CW(p);
+                    }
+                    map[p] = camp;
+                }
+            }
+
+            return map;
+        }
+
+        private static bool IsCenterHexCell(int q, int r)
+        {
+            var s = -q - r;
+            return Mathf.Abs(q) <= CenterRadius && Mathf.Abs(r) <= CenterRadius && Mathf.Abs(s) <= CenterRadius;
+        }
+
+        private static Vector2Int Rotate60CW(Vector2Int p)
+        {
+            return new Vector2Int(-p.y, p.x + p.y);
+        }
+
+        private static string FormatPath(List<Vector2Int> path)
+        {
+            if (path.Count == 0)
+            {
+                return "none";
+            }
+            var parts = new string[path.Count];
+            for (var i = 0; i < path.Count; i++)
+            {
+                parts[i] = $"({path[i].x},{path[i].y})";
+            }
+            return string.Join(" -> ", parts);
+        }
+
+        private void OnDestroy()
+        {
+            _client?.Dispose();
+        }
+    }
+}
