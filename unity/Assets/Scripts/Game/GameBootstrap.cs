@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using JumJump.Network;
 using JumJump.Proto;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
 
 namespace JumJump.Game
 {
@@ -45,14 +47,29 @@ namespace JumJump.Game
         private Vector2Int? _selectedFrom;
         private float _nextPingAt;
 
+        [Header("View")]
+        [SerializeField] private GameBootstrapView view;
+        [SerializeField] private GameBootstrapView viewPrefab;
+
         private bool _reconnectPending;
         private bool _reconnectInFlight;
         private float _nextReconnectAt;
-        private GUIStyle _coordStyle;
-        private GUIStyle _coordBgStyle;
+        private bool _uiBound;
+        private readonly Dictionary<Vector2Int, CellView> _cellViews = new Dictionary<Vector2Int, CellView>();
+
+        private sealed class CellView
+        {
+            public RawImage Fill;
+            public Text Label;
+            public GameObject CoordRoot;
+        }
 
         private async void Start()
         {
+            EnsureEventSystem();
+            EnsureView();
+            BindUi();
+
             _client = new GameClient();
             _client.OnEnvelope += HandleEnvelope;
             _client.OnDisconnected += HandleDisconnected;
@@ -74,6 +91,8 @@ namespace JumJump.Game
             {
                 _ = TryReconnectAsync();
             }
+
+            RefreshUi();
         }
 
         private async System.Threading.Tasks.Task InitialConnectAsync()
@@ -224,149 +243,112 @@ namespace JumJump.Game
             Debug.Log($"recv cmd={cmd} room={env.RoomId} v={env.RoomVersion} status={_status}");
         }
 
-        private void OnGUI()
+        private void EnsureView()
         {
-            GUILayout.BeginArea(new Rect(10, 10, 1080, 760));
-            GUILayout.Label($"Status: {_status}");
-            GUILayout.Label($"Room: {_roomId}");
-            GUILayout.Label($"Self: {_selfUserId}");
-            GUILayout.Label($"Turn: {_board.CurrentTurnUserId}");
-            GUILayout.Label(_selectedFrom.HasValue
-                ? $"Selected: {_selectedFrom.Value.x},{_selectedFrom.Value.y}"
-                : "Selected: none");
-            GUILayout.Label($"Planned jumps: {FormatPath(_plannedPath)}");
-
-            GUILayout.Space(8);
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Submit Jump Path", GUILayout.Width(150)))
+            if (view == null)
             {
-                SubmitPlannedPath();
-            }
-            if (GUILayout.Button("Undo Last Jump", GUILayout.Width(150)))
-            {
-                UndoLastJump();
-            }
-            if (GUILayout.Button("Clear Selection", GUILayout.Width(150)))
-            {
-                ClearMoveSelection();
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.Space(8);
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Start Match", GUILayout.Width(120)))
-            {
-                _ = _client.StartMatchAsync();
-            }
-            if (GUILayout.Button("Cancel Match", GUILayout.Width(120)))
-            {
-                _ = _client.CancelMatchAsync();
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.Space(8);
-            if (GUILayout.Button(showCoordinates ? "Coords: ON" : "Coords: OFF", GUILayout.Width(150)))
-            {
-                showCoordinates = !showCoordinates;
+                view = GetComponentInChildren<GameBootstrapView>(true);
             }
 
-            GUILayout.EndArea();
-
-            DrawStarBoard(new Rect(340, 40, 760, 700));
-        }
-
-        private void DrawStarBoard(Rect area)
-        {
-            EnsureStyles();
-
-            var center = new Vector2(area.x + area.width * 0.5f, area.y + area.height * 0.5f);
-
-            DrawGridLines(center);
-
-            for (var r = -BoardExtent; r <= BoardExtent; r++)
+            if (view == null && viewPrefab != null)
             {
-                for (var q = -BoardExtent; q <= BoardExtent; q++)
-                {
-                    var pos = new Vector2Int(q, r);
-                    if (!_starCells.Contains(pos))
-                    {
-                        continue;
-                    }
+                view = Instantiate(viewPrefab, transform);
+                view.name = viewPrefab.name;
+            }
 
-                    var p = AxialToScreen(pos, center);
-                    var rect = new Rect(p.x - CellSize * 0.5f, p.y - CellSize * 0.5f, CellSize, CellSize);
+            if (view == null || !view.IsValid)
+            {
+                throw new InvalidOperationException("GameBootstrapView is missing or incomplete.");
+            }
 
-                    if (_campByCell.TryGetValue(pos, out var campId))
-                    {
-                        var prev = GUI.color;
-                        GUI.color = CampColors[campId % CampColors.Length];
-                        GUI.DrawTexture(rect, Texture2D.whiteTexture);
-                        GUI.color = prev;
-                    }
-
-                    var label = ".";
-                    var isHint = false;
-                    if (_board.Pieces.TryGetValue(pos, out var owner))
-                    {
-                        label = owner == _selfUserId ? "S" : "O";
-                    }
-                    else if (_selectedFrom.HasValue)
-                    {
-                        var current = _plannedPath.Count == 0 ? _selectedFrom.Value : _plannedPath[_plannedPath.Count - 1];
-                        if (_plannedPath.Count == 0 && IsAdjacentStep(current, pos))
-                        {
-                            label = "+";
-                            isHint = true;
-                        }
-                        else if (CanJumpTo(current, pos))
-                        {
-                            label = "J";
-                            isHint = true;
-                        }
-                    }
-
-                    var prevColor = GUI.color;
-                    if (isHint)
-                    {
-                        GUI.color = new Color(0.7f, 1f, 0.7f);
-                    }
-                    if (GUI.Button(rect, label))
-                    {
-                        OnCellClicked(pos);
-                    }
-                    GUI.color = prevColor;
-
-                    if (showCoordinates)
-                    {
-                        var coordRect = new Rect(rect.x - 8f, rect.y - 12f, rect.width + 16f, 12f);
-                        GUI.Box(coordRect, GUIContent.none, _coordBgStyle);
-                        GUI.Label(coordRect, $"{pos.x},{pos.y}", _coordStyle);
-                    }
-                }
+            if (_cellViews.Count == 0)
+            {
+                DrawGridLines(view.BoardGridRoot);
+                BuildBoardCells(view.BoardCellRoot);
             }
         }
 
-        private void EnsureStyles()
+        private static void EnsureEventSystem()
         {
-            if (_coordStyle != null)
+            if (FindObjectOfType<EventSystem>() != null)
             {
                 return;
             }
 
-            _coordStyle = new GUIStyle(GUI.skin.label)
-            {
-                fontSize = 9,
-                alignment = TextAnchor.MiddleCenter,
-            };
-            _coordStyle.normal.textColor = new Color(0f, 0f, 0f, 1f);
-
-            _coordBgStyle = new GUIStyle(GUI.skin.box);
-            _coordBgStyle.normal.background = Texture2D.whiteTexture;
-            _coordBgStyle.border = new RectOffset(0, 0, 0, 0);
+            new GameObject("EventSystem", typeof(EventSystem), typeof(StandaloneInputModule));
         }
 
-        private void DrawGridLines(Vector2 center)
+        private void BindUi()
         {
+            if (_uiBound)
+            {
+                return;
+            }
+
+            view.SubmitJumpButton.onClick.AddListener(HandleSubmitJumpClicked);
+            view.UndoJumpButton.onClick.AddListener(HandleUndoJumpClicked);
+            view.ClearSelectionButton.onClick.AddListener(HandleClearSelectionClicked);
+            view.StartMatchButton.onClick.AddListener(HandleStartMatchClicked);
+            view.CancelMatchButton.onClick.AddListener(HandleCancelMatchClicked);
+            view.CoordToggleButton.onClick.AddListener(HandleCoordToggleClicked);
+            _uiBound = true;
+        }
+
+        private void UnbindUi()
+        {
+            if (!_uiBound || view == null)
+            {
+                return;
+            }
+
+            view.SubmitJumpButton.onClick.RemoveListener(HandleSubmitJumpClicked);
+            view.UndoJumpButton.onClick.RemoveListener(HandleUndoJumpClicked);
+            view.ClearSelectionButton.onClick.RemoveListener(HandleClearSelectionClicked);
+            view.StartMatchButton.onClick.RemoveListener(HandleStartMatchClicked);
+            view.CancelMatchButton.onClick.RemoveListener(HandleCancelMatchClicked);
+            view.CoordToggleButton.onClick.RemoveListener(HandleCoordToggleClicked);
+            _uiBound = false;
+        }
+
+        private void HandleSubmitJumpClicked()
+        {
+            SubmitPlannedPath();
+            RefreshUi();
+        }
+
+        private void HandleUndoJumpClicked()
+        {
+            UndoLastJump();
+            RefreshUi();
+        }
+
+        private void HandleClearSelectionClicked()
+        {
+            ClearMoveSelection();
+            RefreshUi();
+        }
+
+        private void HandleStartMatchClicked()
+        {
+            _ = _client?.StartMatchAsync();
+            RefreshUi();
+        }
+
+        private void HandleCancelMatchClicked()
+        {
+            _ = _client?.CancelMatchAsync();
+            RefreshUi();
+        }
+
+        private void HandleCoordToggleClicked()
+        {
+            showCoordinates = !showCoordinates;
+            RefreshUi();
+        }
+
+        private void DrawGridLines(RectTransform parent)
+        {
+            var center = Vector2.zero;
             for (var r = -BoardExtent; r <= BoardExtent; r++)
             {
                 for (var q = -BoardExtent; q <= BoardExtent; q++)
@@ -385,28 +367,190 @@ namespace JumJump.Game
                         {
                             continue;
                         }
+
                         var toP = AxialToScreen(to, center);
-                        DrawLine(fromP, toP, new Color(0f, 0f, 0f, 0.22f), 1f);
+                        CreateLine(parent, fromP, toP, new Color(0f, 0f, 0f, 0.22f), 1.5f);
                     }
                 }
             }
         }
 
-        private static void DrawLine(Vector2 a, Vector2 b, Color color, float width)
+        private static void CreateLine(Transform parent, Vector2 from, Vector2 to, Color color, float width)
         {
-            var prevColor = GUI.color;
-            var prevMatrix = GUI.matrix;
+            var go = new GameObject("GridLine", typeof(RectTransform), typeof(RawImage));
+            go.transform.SetParent(parent, false);
 
-            var delta = b - a;
-            var angle = Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg;
-            var length = delta.magnitude;
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = new Vector2(0.5f, 0.5f);
+            rect.anchorMax = new Vector2(0.5f, 0.5f);
+            rect.pivot = new Vector2(0f, 0.5f);
+            rect.anchoredPosition = from;
 
-            GUI.color = color;
-            GUIUtility.RotateAroundPivot(angle, a);
-            GUI.DrawTexture(new Rect(a.x, a.y - width * 0.5f, length, width), Texture2D.whiteTexture);
+            var delta = to - from;
+            rect.sizeDelta = new Vector2(delta.magnitude, width);
+            rect.localRotation = Quaternion.Euler(0f, 0f, Mathf.Atan2(delta.y, delta.x) * Mathf.Rad2Deg);
 
-            GUI.matrix = prevMatrix;
-            GUI.color = prevColor;
+            var image = go.GetComponent<RawImage>();
+            image.color = color;
+            image.raycastTarget = false;
+        }
+
+        private void BuildBoardCells(RectTransform parent)
+        {
+            var center = Vector2.zero;
+            foreach (var pos in _starCells)
+            {
+                var go = new GameObject($"Cell_{pos.x}_{pos.y}", typeof(RectTransform), typeof(RawImage), typeof(Button));
+                go.transform.SetParent(parent, false);
+
+                var rect = go.GetComponent<RectTransform>();
+                rect.anchorMin = new Vector2(0.5f, 0.5f);
+                rect.anchorMax = new Vector2(0.5f, 0.5f);
+                rect.pivot = new Vector2(0.5f, 0.5f);
+                rect.anchoredPosition = AxialToScreen(pos, center);
+                rect.sizeDelta = new Vector2(CellSize, CellSize);
+
+                var fill = go.GetComponent<RawImage>();
+                fill.color = GetBaseCellColor(pos);
+
+                var button = go.GetComponent<Button>();
+                button.targetGraphic = fill;
+                button.onClick.AddListener(() =>
+                {
+                    OnCellClicked(pos);
+                    RefreshUi();
+                });
+
+                var label = CreateRuntimeText("Label", rect, TextAnchor.MiddleCenter, 18, Color.black);
+                StretchToParent(label.rectTransform, Vector2.zero, Vector2.zero);
+
+                var coordRoot = new GameObject("CoordRoot", typeof(RectTransform), typeof(RawImage));
+                coordRoot.transform.SetParent(rect, false);
+
+                var coordRect = coordRoot.GetComponent<RectTransform>();
+                coordRect.anchorMin = new Vector2(0.5f, 1f);
+                coordRect.anchorMax = new Vector2(0.5f, 1f);
+                coordRect.pivot = new Vector2(0.5f, 1f);
+                coordRect.anchoredPosition = new Vector2(0f, 2f);
+                coordRect.sizeDelta = new Vector2(CellSize + 16f, 12f);
+
+                var coordBg = coordRoot.GetComponent<RawImage>();
+                coordBg.color = new Color(1f, 1f, 1f, 0.90f);
+                coordBg.raycastTarget = false;
+
+                var coordText = CreateRuntimeText("CoordText", coordRect, TextAnchor.MiddleCenter, 9, Color.black);
+                coordText.text = $"{pos.x},{pos.y}";
+                StretchToParent(coordText.rectTransform, Vector2.zero, Vector2.zero);
+
+                _cellViews[pos] = new CellView
+                {
+                    Fill = fill,
+                    Label = label,
+                    CoordRoot = coordRoot,
+                };
+            }
+        }
+
+        private static Text CreateRuntimeText(string name, Transform parent, TextAnchor alignment, int fontSize, Color color)
+        {
+            var go = new GameObject(name, typeof(RectTransform), typeof(Text));
+            go.transform.SetParent(parent, false);
+
+            var text = go.GetComponent<Text>();
+            text.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            text.fontSize = fontSize;
+            text.alignment = alignment;
+            text.color = color;
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
+            text.verticalOverflow = VerticalWrapMode.Overflow;
+            text.raycastTarget = false;
+            return text;
+        }
+
+        private static void StretchToParent(RectTransform rect, Vector2 offsetMin, Vector2 offsetMax)
+        {
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.offsetMin = offsetMin;
+            rect.offsetMax = offsetMax;
+        }
+
+        private void RefreshUi()
+        {
+            if (view == null || !view.IsValid)
+            {
+                return;
+            }
+
+            view.StatusText.text = $"Status: {_status}";
+            view.RoomText.text = $"Room: {_roomId}";
+            view.SelfText.text = $"Self: {_selfUserId}";
+            view.TurnText.text = $"Turn: {_board.CurrentTurnUserId}";
+            view.SelectedText.text = _selectedFrom.HasValue
+                ? $"Selected: {_selectedFrom.Value.x},{_selectedFrom.Value.y}"
+                : "Selected: none";
+            view.PlannedPathText.text = $"Planned jumps: {FormatPath(_plannedPath)}";
+            view.CoordToggleLabel.text = showCoordinates ? "Coords: ON" : "Coords: OFF";
+
+            foreach (var pair in _cellViews)
+            {
+                UpdateCellView(pair.Key, pair.Value);
+            }
+        }
+
+        private void UpdateCellView(Vector2Int pos, CellView cell)
+        {
+            var label = ".";
+            var isHint = false;
+
+            if (_board.Pieces.TryGetValue(pos, out var owner))
+            {
+                label = owner == _selfUserId ? "S" : "O";
+            }
+            else if (_selectedFrom.HasValue)
+            {
+                var current = _plannedPath.Count == 0 ? _selectedFrom.Value : _plannedPath[_plannedPath.Count - 1];
+                if (_plannedPath.Count == 0 && IsAdjacentStep(current, pos))
+                {
+                    label = "+";
+                    isHint = true;
+                }
+                else if (CanJumpTo(current, pos))
+                {
+                    label = "J";
+                    isHint = true;
+                }
+            }
+
+            var color = GetBaseCellColor(pos);
+            if (isHint)
+            {
+                color = new Color(0.70f, 1f, 0.70f, 1f);
+            }
+
+            if (_selectedFrom.HasValue && _selectedFrom.Value == pos)
+            {
+                color = new Color(0.45f, 0.80f, 1f, 1f);
+            }
+            else if (_plannedPath.Contains(pos))
+            {
+                color = new Color(1f, 0.88f, 0.55f, 1f);
+            }
+
+            cell.Fill.color = color;
+            cell.Label.text = label;
+            cell.CoordRoot.SetActive(showCoordinates);
+        }
+
+        private Color GetBaseCellColor(Vector2Int pos)
+        {
+            if (_campByCell.TryGetValue(pos, out var campId))
+            {
+                var campColor = CampColors[campId % CampColors.Length];
+                return new Color(campColor.r, campColor.g, campColor.b, 0.95f);
+            }
+
+            return new Color(0.92f, 0.92f, 0.92f, 1f);
         }
 
         private static Vector2 AxialToScreen(Vector2Int pos, Vector2 center)
@@ -670,6 +814,7 @@ namespace JumJump.Game
 
         private void OnDestroy()
         {
+            UnbindUi();
             _client?.Dispose();
         }
     }
