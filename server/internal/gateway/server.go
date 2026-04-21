@@ -48,7 +48,19 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = httpServer.Shutdown(context.Background())
 	}()
 
-	return httpServer.ListenAndServe()
+	var err error
+	if s.cfg.TLSCertFile != "" || s.cfg.TLSKeyFile != "" {
+		if s.cfg.TLSCertFile == "" || s.cfg.TLSKeyFile == "" {
+			return fmt.Errorf("both JUMJUMP_TLS_CERT_FILE and JUMJUMP_TLS_KEY_FILE are required for TLS")
+		}
+		err = httpServer.ListenAndServeTLS(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
+	} else {
+		err = httpServer.ListenAndServe()
+	}
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {

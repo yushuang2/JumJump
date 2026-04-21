@@ -19,7 +19,11 @@ func main() {
 	svc := service.NewGameService()
 	srv := gateway.NewServer(cfg, svc)
 
-	log.Printf("game-server listening on %s", cfg.Addr)
+	scheme := "http/ws"
+	if cfg.TLSCertFile != "" || cfg.TLSKeyFile != "" {
+		scheme = "https/wss"
+	}
+	log.Printf("game-server listening on %s (%s)", cfg.Addr, scheme)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("server stopped: %v", err)
 	}
